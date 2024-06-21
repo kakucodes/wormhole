@@ -27,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	libp2ppb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -71,6 +72,16 @@ var (
 			Name: "wormhole_p2p_receive_channel_overflow",
 			Help: "Total number of p2p received messages dropped due to channel overflow",
 		}, []string{"type"})
+	p2pDrop = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_drops",
+			Help: "Total number of messages that were dropped by libp2p",
+		})
+	p2pReject = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_p2p_rejects",
+			Help: "Total number of messages rejected by libp2p",
+		})
 )
 
 var heartbeatMessagePrefix = []byte("heartbeat|")
@@ -105,6 +116,10 @@ type Components struct {
 	WarnChannelOverflow bool
 	// SignedHeartbeatLogLevel is the log level at which SignedHeartbeatReceived events will be logged.
 	SignedHeartbeatLogLevel zapcore.Level
+	// GossipParams is used to configure the GossipSub instance used by the Guardian.
+	GossipParams pubsub.GossipSubParams
+	// GossipAdvertiseAddress is an override for the external IP advertised via p2p to other peers.
+	GossipAdvertiseAddress string
 }
 
 func (f *Components) ListeningAddresses() []string {
@@ -134,6 +149,7 @@ func DefaultComponents() *Components {
 		ConnMgr:                    mgr,
 		ProtectedHostByGuardianKey: make(map[eth_common.Address]peer.ID),
 		SignedHeartbeatLogLevel:    zapcore.DebugLevel,
+		GossipParams:               pubsub.DefaultGossipSubParams(),
 	}
 }
 
@@ -148,6 +164,21 @@ func DefaultConnectionManager() (*connmgr.BasicConnMgr, error) {
 		// GracePeriod set to 0 means that new peers are not protected by a grace period
 		connmgr.WithGracePeriod(0),
 	)
+}
+
+// traceHandler is used to intercept libp2p trace events so we can peg metrics.
+type traceHandler struct {
+}
+
+// Trace is the interface to the libp2p trace handler. It pegs metrics as appropriate.
+func (*traceHandler) Trace(evt *libp2ppb.TraceEvent) {
+	if evt.Type != nil {
+		if *evt.Type == libp2ppb.TraceEvent_DROP_RPC {
+			p2pDrop.Inc()
+		} else if *evt.Type == libp2ppb.TraceEvent_REJECT_MESSAGE {
+			p2pReject.Inc()
+		}
+	}
 }
 
 // BootstrapAddrs takes a comma-separated string of multi-address strings and returns an array of []peer.AddrInfo that does not include `self`.
@@ -193,9 +224,24 @@ func ConnectToPeers(ctx context.Context, logger *zap.Logger, h host.Host, peers 
 }
 
 func NewHost(logger *zap.Logger, ctx context.Context, networkID string, bootstrapPeers string, components *Components, priv crypto.PrivKey) (host.Host, error) {
-	if err := evaluateCutOver(logger, networkID); err != nil {
-		return nil, err
+
+	// if an override of the advertised gossip addresses is requested
+	// check & render address once for use in the AddrsFactory below
+	var gossipAdvertiseAddress multiaddr.Multiaddr
+	if components.GossipAdvertiseAddress != "" {
+		gossipAdvertiseAddress, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d", components.GossipAdvertiseAddress, components.Port))
+		if err != nil {
+			// If the multiaddr is specified incorrectly, blow up
+			logger.Fatal("error with the specified gossip address",
+				zap.String("GossipAdvertiseAddress", components.GossipAdvertiseAddress),
+				zap.Error(err),
+			)
+		}
+		logger.Info("Overriding the advertised p2p address",
+			zap.String("GossipAdvertiseAddress", gossipAdvertiseAddress.String()),
+		)
 	}
+
 	h, err := libp2p.New(
 		// Use the keypair we generated
 		libp2p.Identity(priv),
@@ -204,6 +250,17 @@ func NewHost(logger *zap.Logger, ctx context.Context, networkID string, bootstra
 		libp2p.ListenAddrStrings(
 			components.ListeningAddresses()...,
 		),
+
+		// Takes the multiaddrs we are listening on and returns the multiaddrs to advertise to the network to
+		// connect to. Allows overriding the announce address for nodes running behind a NAT or in kubernetes
+		// This function gets called by the libp2p background() process regularly to check for address changes
+		// that are then announced to the rest of the network.
+		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			if gossipAdvertiseAddress != nil {
+				return []multiaddr.Multiaddr{gossipAdvertiseAddress}
+			}
+			return addrs
+		}),
 
 		// Enable TLS security as the only security protocol.
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
@@ -217,6 +274,8 @@ func NewHost(logger *zap.Logger, ctx context.Context, networkID string, bootstra
 
 		// Let this host use the DHT to find other hosts
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			// Update the bootstrap peers string so we will log the updated value.
+			bootstrapPeers = cutOverBootstrapPeers(bootstrapPeers)
 			logger.Info("Connecting to bootstrap peers", zap.String("bootstrap_peers", bootstrapPeers))
 
 			bootstrappers, _ := BootstrapAddrs(logger, bootstrapPeers, h.ID())
@@ -299,20 +358,23 @@ func Run(
 		topic := fmt.Sprintf("%s/%s", networkID, "broadcast")
 
 		bootstrappers, bootstrapNode := BootstrapAddrs(logger, bootstrapPeers, h.ID())
-		gossipParams := pubsub.DefaultGossipSubParams()
 
 		if bootstrapNode {
 			logger.Info("We are a bootstrap node.")
 			if networkID == "/wormhole/testnet/2/1" {
-				gossipParams.Dhi = TESTNET_BOOTSTRAP_DHI
-				logger.Info("We are a bootstrap node in Testnet. Setting gossipParams.Dhi.", zap.Int("gossipParams.Dhi", gossipParams.Dhi))
+				components.GossipParams.Dhi = TESTNET_BOOTSTRAP_DHI
+				logger.Info("We are a bootstrap node in Testnet. Setting gossipParams.Dhi.", zap.Int("gossipParams.Dhi", components.GossipParams.Dhi))
 			}
 		}
 
 		logger.Info("Subscribing pubsub topic", zap.String("topic", topic))
+		ourTracer := &traceHandler{}
 		ps, err := pubsub.NewGossipSub(ctx, h,
 			pubsub.WithValidateQueueSize(P2P_VALIDATE_QUEUE_SIZE),
-			pubsub.WithGossipSubParams(gossipParams),
+			pubsub.WithGossipSubParams(components.GossipParams),
+			pubsub.WithEventTracer(ourTracer),
+			// TODO: Investigate making this change. May need to use LaxSign until everyone has upgraded to that.
+			// pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign),
 		)
 		if err != nil {
 			panic(err)
@@ -356,7 +418,7 @@ func Run(
 
 		if ccqEnabled {
 			ccqErrC := make(chan error)
-			ccq := newCcqRunP2p(logger, ccqAllowedPeers)
+			ccq := newCcqRunP2p(logger, ccqAllowedPeers, components)
 			if err := ccq.run(ctx, priv, gk, networkID, ccqBootstrapPeers, ccqPort, signedQueryReqC, queryResponseReadC, ccqErrC); err != nil {
 				return fmt.Errorf("failed to start p2p for CCQ: %w", err)
 			}
@@ -528,7 +590,9 @@ func Run(
 					}
 
 					// Send to local observation request queue (the loopback message is ignored)
-					obsvReqC <- msg
+					if obsvReqC != nil {
+						obsvReqC <- msg
+					}
 
 					err = th.Publish(ctx, b)
 					p2pMessagesSent.Inc()
@@ -558,16 +622,19 @@ func Run(
 			}
 
 			if envelope.GetFrom() == h.ID() {
-				logger.Debug("received message from ourselves, ignoring",
-					zap.Any("payload", msg.Message))
+				if logger.Level().Enabled(zapcore.DebugLevel) {
+					logger.Debug("received message from ourselves, ignoring", zap.Any("payload", msg.Message))
+				}
 				p2pMessagesReceived.WithLabelValues("loopback").Inc()
 				continue
 			}
 
-			logger.Debug("received message",
-				zap.Any("payload", msg.Message),
-				zap.Binary("raw", envelope.Data),
-				zap.String("from", envelope.GetFrom().String()))
+			if logger.Level().Enabled(zapcore.DebugLevel) {
+				logger.Debug("received message",
+					zap.Any("payload", msg.Message),
+					zap.Binary("raw", envelope.Data),
+					zap.String("from", envelope.GetFrom().String()))
+			}
 
 			switch m := msg.Message.(type) {
 			case *gossipv1.GossipMessage_SignedHeartbeat:
@@ -607,7 +674,7 @@ func Run(
 									zap.String("from", envelope.GetFrom().String()))
 							} else {
 								guardianAddr := eth_common.BytesToAddress(s.GuardianAddr)
-								if guardianAddr != ethcrypto.PubkeyToAddress(gk.PublicKey) {
+								if gk == nil || guardianAddr != ethcrypto.PubkeyToAddress(gk.PublicKey) {
 									prevPeerId, ok := components.ProtectedHostByGuardianKey[guardianAddr]
 									if ok {
 										if prevPeerId != peerId {
@@ -627,64 +694,72 @@ func Run(
 								}
 							}
 						} else {
-							logger.Debug("p2p_node_id_not_in_heartbeat",
-								zap.Error(err),
-								zap.Any("payload", heartbeat.NodeName))
+							if logger.Level().Enabled(zapcore.DebugLevel) {
+								logger.Debug("p2p_node_id_not_in_heartbeat", zap.Error(err), zap.Any("payload", heartbeat.NodeName))
+							}
 						}
 					}()
 				}
 			case *gossipv1.GossipMessage_SignedObservation:
-				if err := common.PostMsgWithTimestamp[gossipv1.SignedObservation](m.SignedObservation, obsvC); err == nil {
-					p2pMessagesReceived.WithLabelValues("observation").Inc()
-				} else {
-					if components.WarnChannelOverflow {
-						logger.Warn("Ignoring SignedObservation because obsvC full", zap.String("hash", hex.EncodeToString(m.SignedObservation.Hash)))
+				if obsvC != nil {
+					if err := common.PostMsgWithTimestamp[gossipv1.SignedObservation](m.SignedObservation, obsvC); err == nil {
+						p2pMessagesReceived.WithLabelValues("observation").Inc()
+					} else {
+						if components.WarnChannelOverflow {
+							logger.Warn("Ignoring SignedObservation because obsvC full", zap.String("hash", hex.EncodeToString(m.SignedObservation.Hash)))
+						}
+						p2pReceiveChannelOverflow.WithLabelValues("observation").Inc()
 					}
-					p2pReceiveChannelOverflow.WithLabelValues("observation").Inc()
 				}
 			case *gossipv1.GossipMessage_SignedVaaWithQuorum:
-				select {
-				case signedInC <- m.SignedVaaWithQuorum:
-					p2pMessagesReceived.WithLabelValues("signed_vaa_with_quorum").Inc()
-				default:
-					if components.WarnChannelOverflow {
-						// TODO do not log this in production
-						var hexStr string
-						if vaa, err := vaa.Unmarshal(m.SignedVaaWithQuorum.Vaa); err == nil {
-							hexStr = vaa.HexDigest()
+				if signedInC != nil {
+					select {
+					case signedInC <- m.SignedVaaWithQuorum:
+						p2pMessagesReceived.WithLabelValues("signed_vaa_with_quorum").Inc()
+					default:
+						if components.WarnChannelOverflow {
+							// TODO do not log this in production
+							var hexStr string
+							if vaa, err := vaa.Unmarshal(m.SignedVaaWithQuorum.Vaa); err == nil {
+								hexStr = vaa.HexDigest()
+							}
+							logger.Warn("Ignoring SignedVaaWithQuorum because signedInC full", zap.String("hash", hexStr))
 						}
-						logger.Warn("Ignoring SignedVaaWithQuorum because signedInC full", zap.String("hash", hexStr))
+						p2pReceiveChannelOverflow.WithLabelValues("signed_vaa_with_quorum").Inc()
 					}
-					p2pReceiveChannelOverflow.WithLabelValues("signed_vaa_with_quorum").Inc()
 				}
 			case *gossipv1.GossipMessage_SignedObservationRequest:
-				s := m.SignedObservationRequest
-				gs := gst.Get()
-				if gs == nil {
-					logger.Debug("dropping SignedObservationRequest - no guardian set",
-						zap.Any("value", s),
-						zap.String("from", envelope.GetFrom().String()))
-					break
-				}
-				r, err := processSignedObservationRequest(s, gs)
-				if err != nil {
-					p2pMessagesReceived.WithLabelValues("invalid_signed_observation_request").Inc()
-					logger.Debug("invalid signed observation request received",
-						zap.Error(err),
-						zap.Any("payload", msg.Message),
-						zap.Any("value", s),
-						zap.Binary("raw", envelope.Data),
-						zap.String("from", envelope.GetFrom().String()))
-				} else {
-					logger.Debug("valid signed observation request received",
-						zap.Any("value", r),
-						zap.String("from", envelope.GetFrom().String()))
+				if obsvReqC != nil {
+					s := m.SignedObservationRequest
+					gs := gst.Get()
+					if gs == nil {
+						if logger.Level().Enabled(zapcore.DebugLevel) {
+							logger.Debug("dropping SignedObservationRequest - no guardian set", zap.Any("value", s), zap.String("from", envelope.GetFrom().String()))
+						}
+						break
+					}
+					r, err := processSignedObservationRequest(s, gs)
+					if err != nil {
+						p2pMessagesReceived.WithLabelValues("invalid_signed_observation_request").Inc()
+						if logger.Level().Enabled(zapcore.DebugLevel) {
+							logger.Debug("invalid signed observation request received",
+								zap.Error(err),
+								zap.Any("payload", msg.Message),
+								zap.Any("value", s),
+								zap.Binary("raw", envelope.Data),
+								zap.String("from", envelope.GetFrom().String()))
+						}
+					} else {
+						if logger.Level().Enabled(zapcore.DebugLevel) {
+							logger.Debug("valid signed observation request received", zap.Any("value", r), zap.String("from", envelope.GetFrom().String()))
+						}
 
-					select {
-					case obsvReqC <- r:
-						p2pMessagesReceived.WithLabelValues("signed_observation_request").Inc()
-					default:
-						p2pReceiveChannelOverflow.WithLabelValues("signed_observation_request").Inc()
+						select {
+						case obsvReqC <- r:
+							p2pMessagesReceived.WithLabelValues("signed_observation_request").Inc()
+						default:
+							p2pReceiveChannelOverflow.WithLabelValues("signed_observation_request").Inc()
+						}
 					}
 				}
 			case *gossipv1.GossipMessage_SignedChainGovernorConfig:
@@ -769,6 +844,15 @@ func processSignedHeartbeat(from peer.ID, s *gossipv1.SignedHeartbeat, gs *commo
 
 	if h.GuardianAddr != signerAddr.String() {
 		return nil, fmt.Errorf("GuardianAddr in heartbeat does not match signerAddr")
+	}
+
+	// Don't accept replayed heartbeats from other peers
+	signedPeer, err := peer.IDFromBytes(h.P2PNodeId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode peer ID from bytes: %w", err)
+	}
+	if signedPeer != from {
+		return nil, fmt.Errorf("guardian signed peer does not match sending peer")
 	}
 
 	// Store verified heartbeat in global guardian set state.

@@ -39,16 +39,18 @@ var (
 type ccqP2p struct {
 	logger *zap.Logger
 
-	h            host.Host
-	th_req       *pubsub.Topic
-	th_resp      *pubsub.Topic
-	sub          *pubsub.Subscription
-	allowedPeers map[string]struct{}
+	h             host.Host
+	th_req        *pubsub.Topic
+	th_resp       *pubsub.Topic
+	sub           *pubsub.Subscription
+	allowedPeers  map[string]struct{}
+	p2pComponents *Components
 }
 
 func newCcqRunP2p(
 	logger *zap.Logger,
 	allowedPeersStr string,
+	components *Components,
 ) *ccqP2p {
 	l := logger.With(zap.String("component", "ccqp2p"))
 	allowedPeers := make(map[string]struct{})
@@ -60,8 +62,9 @@ func newCcqRunP2p(
 	}
 
 	return &ccqP2p{
-		logger:       l,
-		allowedPeers: allowedPeers,
+		logger:        l,
+		allowedPeers:  allowedPeers,
+		p2pComponents: components,
 	}
 }
 
@@ -85,9 +88,19 @@ func (ccq *ccqP2p) run(
 	}
 	components.Port = port
 
+	// Pass the gossip advertize address through to NewHost() if it was defined
+	components.GossipAdvertiseAddress = ccq.p2pComponents.GossipAdvertiseAddress
+
 	ccq.h, err = NewHost(ccq.logger, ctx, networkID, bootstrapPeers, components, priv)
 	if err != nil {
 		return fmt.Errorf("failed to create p2p: %w", err)
+	}
+
+	// Build a map of bootstrap peers so we can always allow subscribe requests from them.
+	bootstrapPeersMap := map[string]struct{}{}
+	bootstrappers, _ := BootstrapAddrs(ccq.logger, bootstrapPeers, ccq.h.ID())
+	for _, peer := range bootstrappers {
+		bootstrapPeersMap[peer.ID.String()] = struct{}{}
 	}
 
 	topic_req := fmt.Sprintf("%s/%s", networkID, "ccq_req")
@@ -103,7 +116,17 @@ func (ccq *ccqP2p) run(
 			if _, found := ccq.allowedPeers[peerID.String()]; found {
 				return true
 			}
-			ccq.logger.Info("Dropping subscribe attempt from unknown peer", zap.String("peerID", peerID.String()))
+			ccq.p2pComponents.ProtectedHostByGuardianKeyLock.Lock()
+			defer ccq.p2pComponents.ProtectedHostByGuardianKeyLock.Unlock()
+			for _, guardianPeerID := range ccq.p2pComponents.ProtectedHostByGuardianKey {
+				if peerID == guardianPeerID {
+					return true
+				}
+			}
+			if _, found := bootstrapPeersMap[peerID.String()]; found {
+				return true
+			}
+			ccq.logger.Debug("Dropping subscribe attempt from unknown peer", zap.String("peerID", peerID.String()))
 			return false
 		}))
 	if err != nil {
@@ -127,10 +150,13 @@ func (ccq *ccqP2p) run(
 		if len(ccq.allowedPeers) == 0 {
 			return true
 		}
-		if _, found := ccq.allowedPeers[from.String()]; found {
+		if _, found := ccq.allowedPeers[msg.GetFrom().String()]; found {
 			return true
 		}
-		ccq.logger.Info("Dropping message from unknown peer", zap.String("fromPeerID", from.String()))
+		ccq.logger.Debug("Dropping message from unknown peer",
+			zap.String("fromPeerID", from.String()),
+			zap.String("msgPeerID", msg.ReceivedFrom.String()),
+			zap.String("msgFrom", msg.GetFrom().String()))
 		return false
 	})
 	if err != nil {
@@ -238,17 +264,17 @@ func (ccq *ccqP2p) publisher(ctx context.Context, gk *ecdsa.PrivateKey, queryRes
 				panic(err)
 			}
 			err = ccq.th_resp.Publish(ctx, b)
-			ccqP2pMessagesSent.Inc()
 			if err != nil {
 				ccq.logger.Error("failed to publish query response",
-					zap.String("requestID", msg.RequestID()),
+					zap.String("requestSignature", msg.Signature()),
 					zap.Any("query_response", msg),
 					zap.Any("signature", sig),
 					zap.Error(err),
 				)
 			} else {
+				ccqP2pMessagesSent.Inc()
 				ccq.logger.Info("published signed query response", //TODO: Change to Debug
-					zap.String("requestID", msg.RequestID()),
+					zap.String("requestSignature", msg.Signature()),
 					zap.Any("query_response", msg),
 					zap.Any("signature", sig),
 				)
